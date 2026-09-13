@@ -93,7 +93,7 @@ impl<const S: usize, const D: bool> InlineFn<S, D>
                 }
                 false =>
                 {
-                    assert_boxing_allowed(D, std::any::type_name::<Self>(), S);
+                    assert_boxing_allowed::<T, S>(D, std::any::type_name::<Self>());
                     buffer.as_mut_ptr().cast::<Box<T>>().write(Box::new(f));
                     FnAlias::<T, S>::BOXED
                 }
@@ -389,7 +389,7 @@ mod test
     }
 
     #[test]
-    #[should_panic(expected = "cannot fit")]
+    #[should_panic(expected = "cannot store")]
     fn oversized_closure_panics_when_boxing_is_disabled()
     {
         let payload = [0u8; LARGE * 2];

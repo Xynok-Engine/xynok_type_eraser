@@ -59,10 +59,25 @@ pub(crate) fn assert_buffer_size<const S: usize>(type_name: &str)
 }
 
 /// Refuses the heap fallback when the caller asked for inline storage only.
+///
+/// The closure that did not fit has no name a user would recognise, so the
+/// message spells out everything needed to fix it: the full type name of the
+/// closure, what it needs, and what the buffer actually offers. Usually one of
+/// the two numbers is the culprit, either the size or the alignment.
 #[track_caller]
-pub(crate) fn assert_boxing_allowed(allowed: bool, type_name: &str, size: usize)
+pub(crate) fn assert_boxing_allowed<T, const S: usize>(allowed: bool, type_name: &str)
 {
-    assert!(allowed, "The size_of::<{type_name}> cannot fit {size}");
+    assert!(
+        allowed,
+        "`{type_name}` cannot store `{closure}` inline and boxing is off.\n\
+         closure: size {closure_size} bytes, align {closure_align} bytes\n\
+         buffer:  size {S} bytes, align {buffer_align} bytes\n\
+         Raise the buffer size, or allow boxing, to store this closure.",
+        closure = std::any::type_name::<T>(),
+        closure_size = size_of::<T>(),
+        closure_align = align_of::<T>(),
+        buffer_align = align_of::<FnBuffer<S>>(),
+    );
 }
 
 #[cfg(test)]
