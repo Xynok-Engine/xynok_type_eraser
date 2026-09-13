@@ -1,140 +1,154 @@
 ---
-title: What is memory alignment?
-excerpt: What is memory alignment, and why does it matter?
-cover img: "../images/async_await.png"
+title: Size, stride, and alignment
+excerpt: How a type occupies memory and why raw storage must account for more than its byte count.
 tags:
-  - bit
+  - memory
   - addendum
 ---
-# Alignment (Memory alignment)
 
-This note explains what alignment is, why it exists, and why `InlineFn` needs to care about it while standard Rust code generally does not.
+# Size, stride, and alignment
 
-## Memory isn't as flat as you think
+Every value stored in memory has three related properties:
 
-Logically, RAM is a sequence of bytes, each with an address: 0, 1, 2, 3...
+- **Size** is the number of bytes occupied by one value.
+- **Stride** is the distance in bytes from the start of one value to the start of the next value in a contiguous sequence.
+- **Alignment** is the address boundary on which a value must begin.
 
-However, the CPU does not read one byte at a time. It reads in blocks, typically 8 bytes at once on 64-bit machines. These blocks are fixed, starting at addresses 0, 8, 16, 24... Think of it like a cabinet with pre-divided shelves, each holding 8 slots. You can only open a whole shelf, not half of one.
+These properties are easy to ignore when using normal Rust values because the compiler, `Box`, and collections such as `Vec` handle them. They matter when implementing raw storage, allocating memory manually, exchanging data with another language, or calculating field offsets.
 
-Reading a `u64` (8 bytes) located at address 8:
+## Size
 
-```
-address:  0  1  2  3  4  5  6  7 | 8  9 10 11 12 13 14 15
-block:    [------- block 0 -----] [------- block 1 -----]
-u64:                               ^^^^^^^^^^^^^^^^^^^^^^
-```
-
-It sits neatly within block 1, so the CPU loads one block and is done.
-
-The same `u64` but at address 5:
-
-```
-address:  0  1  2  3  4  5  6  7 | 8  9 10 11 12 13 14 15
-block:    [------- block 0 -----] [------- block 1 -----]
-u64:                     ^^^^^^^^^^^^^^^^^^^^
-```
-
-It straddles two blocks. The CPU must load block 0, load block 1, then stitch them together. This is slower, and on some architectures, it is simply impossible, causing the hardware to trigger an error.
-
-## Definition
-
-`align_of::<T>()` answers the question: "What must the address of a value of type `T` be divisible by?"
-
-On a 64-bit machine:
-
-| Type | size | align | address must be divisible by |
-| --- | --- | --- | --- |
-| `u8`, `bool` | 1 | 1 | 1 (can be anywhere) |
-| `u16` | 2 | 2 | 2 |
-| `u32`, `char` | 4 | 4 | 4 |
-| `u64`, `usize`, all pointers | 8 | 8 | 8 |
-| `u128` | 16 | 16 | 16 |
-
-A `u64` at address 5 is misaligned, because 5 is not divisible by 8. At addresses 8, 16, or 24, it is fine.
-
-For a struct, the alignment is equal to the largest alignment among its fields:
+Rust reports the size of a type with `std::mem::size_of`:
 
 ```rust
-struct Foo
-{
-    a: u8,  // align 1
-    b: u64, // align 8
-}
-// align_of::<Foo>() == 8
+use std::mem::size_of;
+
+assert_eq!(size_of::<u8>(), 1);
+assert_eq!(size_of::<u32>(), 4);
+assert_eq!(size_of::<[u32; 2]>(), 8);
 ```
 
-## Padding: where alignment shows itself
-
-The `Foo` struct above looks like it only needs 9 bytes, but `size_of::<Foo>()` is 16:
-
-```
-offset:  0  1  2  3  4  5  6  7  8 ...    15
-         a  ▓  ▓  ▓  ▓  ▓  ▓  ▓  [---- b ----]
-            └──── 7 bytes of padding ────┘
-```
-
-`b` cannot reside at offset 1. If `Foo` is placed at an address divisible by 8, `b` would fall at an address that, when divided by 8, leaves a remainder of 1, which is misaligned. The compiler inserts 7 empty bytes to push `b` to offset 8. Additionally, the size of a struct is always a multiple of its alignment, so the total is 16 rather than 9.
-
-Rust is allowed to reorder fields to optimize this for you. C is not, which is why C programmers often pay close attention to the order of declaration.
-
-## Why nobody usually thinks about this
-
-Because the compiler and the standard library handle everything:
-
-- `let x = 5u64;` causes the compiler to place `x` at an aligned address on the stack.
-- `Box::new(v)` calls the allocator with the correct alignment for the type.
-- `Vec<T>` allocates memory aligned according to `T`.
-
-You only need to worry about this when managing raw memory yourself. That is exactly what `InlineFn` is doing.
-
-## What happens if you ignore it
-
-"But x86 reads and writes work even when misaligned, right?" True, most `mov` instructions on x86 handle misaligned addresses. This is why this type of bug often runs perfectly during development only to crash in production. There are three reasons you still shouldn't rely on this:
-
-1. **UB is UB to the optimizer.** LLVM is allowed to assume a pointer is aligned and optimize based on that assumption. It could remove a check, merge two load instructions, or generate nonsense code in a completely unrelated area. This is not just a case of "running a bit slower."
-
-2. **SIMD will actually break.** If data has an alignment of 16 and LLVM decides to copy it using `movaps`, a misaligned address will fault immediately, resulting in a segfault rather than incorrect data.
-
-3. **ARM.** AArch64 can handle misalignment with standard load/store instructions, but atomic instructions (`ldxr`/`stxr`) require strict alignment. A closure capturing an `Arc` will increment or decrement the refcount using an atomic operation on that very pointer.
-
-## How this relates to `InlineFn`
-
-`InlineFn` stores a closure in a raw buffer instead of a `Box` to avoid heap allocation. That buffer is currently:
+For a struct, size includes its fields and any padding inserted between or after them. Consider a type with a stable C-compatible field order:
 
 ```rust
-struct FnBuffer<const SIZE: usize>
+#[repr(C)]
+struct Puppy
 {
-    buffer: [MaybeUninit<u8>; SIZE],
+    age:        u64,
+    is_trained: bool,
 }
 ```
 
-It is a `u8` array, meaning the alignment is 1. In other words, we have just told the compiler that "this area can be placed anywhere, I don't need alignment." The compiler believes us and has the right to place it at any arbitrary address.
+The fields contain nine bytes of data: eight for `age` and one for `is_trained`. The struct normally occupies 16 bytes, however, because it needs seven trailing padding bytes:
 
-Then we write the closure into it:
-
+```text
+offset:  0 1 2 3 4 5 6 7  8  9 10 11 12 13 14 15
+         [---- age ----]  T  ·  ·  ·  ·  ·  ·  ·
+                              seven padding bytes
 ```
-buffer.as_mut_ptr().cast::<T>().write(f);
-```
 
-`ptr::write::<T>` has a mandatory requirement in its safety contract: the pointer must be aligned to `align_of::<T>()`. If the closure captures an `Arc`, it contains an 8-byte aligned pointer, but we are writing it into a region we promised only has 1-byte alignment. This violates the contract, which is UB, regardless of whether the buffer is large enough.
-
-Therefore, `is_fit` must check two conditions, not just one:
+The exact values are target-dependent, so code can inspect them instead of assuming them:
 
 ```rust
-fn is_fit<T: IRunnable, const S: usize>() -> bool
+assert_eq!(size_of::<Puppy>(), 16); // on common 64-bit targets
+```
+
+## Alignment
+
+Alignment describes which addresses are valid for a type. `std::mem::align_of::<T>()` returns the required boundary. If a type has alignment 8, its address must be divisible by 8, such as 0, 8, 16, or 24.
+
+```rust
+use std::mem::align_of;
+
+assert_eq!(align_of::<u8>(), 1);
+assert_eq!(align_of::<u32>(), 4);
+assert_eq!(align_of::<u64>(), 8); // on common 64-bit targets
+```
+
+The alignment of a C-layout struct is at least the largest alignment of its fields. `Puppy` therefore has alignment 8 on a target where `u64` has alignment 8.
+
+Alignment affects both field placement and total size. In a contiguous array, every element must begin at a correctly aligned address. If `Puppy` used only its nine data bytes, the second value would start at address 9, which is invalid for its `u64` field. Padding rounds the element's occupied space up to 16 bytes, so subsequent elements begin at 16, 32, 48, and so on.
+
+Misaligned typed pointer reads and writes are undefined behavior in Rust, even on hardware that can perform some unaligned operations. Raw-pointer functions such as `ptr::read_unaligned` exist for data that is intentionally unaligned, but they do not make an unaligned address suitable for storing and using an ordinary `T`.
+
+## Stride
+
+Stride answers a pointer-arithmetic question: how far must a pointer move to reach the next element?
+
+```text
+first value                              second value
+┌─────────────────────────────────────┐  ┌────────────
+│ 9 bytes of fields + 7 bytes padding │  │ ...
+└─────────────────────────────────────┘  └────────────
+^                                        ^
+address 0                                address 16
+                 stride = 16
+```
+
+Swift exposes size and stride separately: a value may have a size of 9 and a stride of 16 because Swift's size does not include trailing padding. Rust uses a different definition. `size_of::<T>()` includes trailing padding, and array elements are always `size_of::<T>()` bytes apart. Rust therefore has no separate `stride_of` function for ordinary sized types:
+
+```rust
+use std::mem::size_of;
+
+let values = [
+    Puppy { age: 1, is_trained: false },
+    Puppy { age: 2, is_trained: true },
+];
+
+let first = values.as_ptr() as usize;
+let second = unsafe { values.as_ptr().add(1) } as usize;
+
+assert_eq!(second - first, size_of::<Puppy>());
+```
+
+For Rust arrays, the practical relationship is:
+
+```text
+stride(T) = size_of::<T>()
+```
+
+This also means `[T; N]` has size `size_of::<T>() * N`. The special case is a zero-sized type such as `()`: its size and array stride are zero even though Rust references still have alignment and validity requirements.
+
+## Padding and field order
+
+Padding can appear between fields as well as after the last field. With C layout, reversing the fields changes where the padding goes:
+
+```rust
+#[repr(C)]
+struct AlternatePuppy
 {
-    size_of::<T>() <= S                             // does it fit?
-        && align_of::<T>() <= align_of::<FnBuffer<S>>() // can it be placed correctly?
+    is_trained: bool,
+    age:        u64,
 }
 ```
 
-Size answers "does the closure fit in the buffer?" Alignment answers "can the buffer place the closure correctly?" These are two distinct questions, and both must be true to use the inline path. If either is false, `InlineFn` falls back to the boxed path, where the allocator ensures correct alignment for us.
+```text
+offset:  0  1 2 3 4 5 6 7  8 9 10 11 12 13 14 15
+         T  · · · · · · ·  [--------- age --------]
+            seven padding bytes
+```
 
-## Current status and fix
+Both examples normally have size 16 and alignment 8. Only the padding position changes. A declaration without `#[repr(C)]` uses Rust's default representation; its field layout is not an interface you should calculate or depend on because the compiler may choose a different order.
 
-Because `align_of::<FnBuffer<S>>()` is currently 1, the second condition is almost always false. The code isn't incorrect, but it is refusing to inline almost every closure that captures variables, meaning the fast path essentially does not exist.
+## Why `InlineFn` checks size and alignment
 
-The fix is to increase the promise of the buffer rather than relaxing `is_fit`:
+`InlineFn` stores a closure directly in a byte buffer when possible, avoiding a heap allocation. A closure fits inline only when both of these statements are true:
+
+1. Its bytes fit within the buffer's capacity.
+2. Its required alignment does not exceed the alignment guaranteed by the buffer.
+
+The implementation expresses those independent requirements directly:
+
+```rust
+fn is_fit<T, const S: usize>() -> bool
+{
+    size_of::<T>() <= S && align_of::<T>() <= align_of::<FnBuffer<S>>()
+}
+```
+
+A plain `[MaybeUninit<u8>; S]` has alignment 1. It may contain enough bytes for a captured pointer or integer, but its starting address is not guaranteed to be valid for that value. Writing a `T` through a misaligned `*mut T` would be undefined behavior.
+
+`FnBuffer` raises the storage alignment explicitly:
 
 ```rust
 #[repr(C, align(16))]
@@ -144,15 +158,22 @@ struct FnBuffer<const SIZE: usize>
 }
 ```
 
-Now we tell the compiler that this struct must always reside at an address divisible by 16, and the compiler ensures this wherever `FnBuffer` appears. Because 16 is divisible by 8, 4, 2, and 1, any closure capturing pointers, `u32`, `u64`, or `u128` can be placed there. `is_fit` remains unchanged, but now it passes.
+An alignment of 16 can hold types requiring alignment 1, 2, 4, 8, or 16, provided their size also fits. A type requiring a larger alignment falls back to boxed storage, where the allocator supplies a suitable address.
 
-Types requiring alignment greater than 16 (for example, SIMD `__m256` which requires 32) will still automatically fall back to the boxed path, just as we want. This is why you should keep the alignment condition in `is_fit` instead of removing it.
+Raising alignment can also raise size. Because a Rust type's size must preserve alignment between array elements, `FnBuffer<20>` occupies 32 bytes after rounding 20 up to the next multiple of 16. `FnBuffer<32>` and `FnBuffer<64>` need no extra padding.
 
-A small note: `align(16)` causes `size_of::<FnBuffer<S>>()` to be rounded up to a multiple of 16. With `SMALL = 32` and `LARGE = 64`, nothing changes, but `InlineFn<20>` will occupy 32 bytes instead of 20.
+## Rules of thumb
+
+- Use `size_of::<T>()` to determine how many bytes Rust reserves for a `T`.
+- Use `align_of::<T>()` when allocating storage or converting raw addresses into typed pointers.
+- Advance a `*const T` or `*mut T` with `.add(n)`; Rust scales the offset by `size_of::<T>()`.
+- Do not calculate Rust's default struct layout from its source field order.
+- When deciding whether a value fits in raw storage, check both size and alignment.
 
 ## Further reading
 
+- [Size, Stride, Alignment](https://swiftunboxed.com/internals/size-stride-alignment/), the Swift Unboxed article that inspired this explanation
 - [Type layout](https://doc.rust-lang.org/reference/type-layout.html) in the Rust Reference
-- [`std::ptr::write`](https://doc.rust-lang.org/std/ptr/fn.write.html), under Safety
+- [`std::mem::size_of`](https://doc.rust-lang.org/std/mem/fn.size_of.html)
 - [`std::mem::align_of`](https://doc.rust-lang.org/std/mem/fn.align_of.html)
-- https://swiftunboxed.com/internals/size-stride-alignment/
+- [`std::ptr::write`](https://doc.rust-lang.org/std/ptr/fn.write.html)
